@@ -1,9 +1,20 @@
 import Accelerate
+import AppKit
 import AudioToolbox
 import CoreAudio
 import Foundation
 
 private let logger = AppLogger(category: "AudioEngine")
+
+private enum TapSource: Equatable {
+  case everythingExceptSelf
+  case fineTune(AudioObjectID)
+}
+
+private let fineTuneBundleID = "com.finetuneapp.FineTune"
+private let fineTuneFallbackDelay: TimeInterval = 3.0
+private let tapSourceCoalesceDelay: TimeInterval = 0.15
+private let tapSourceSafetyNetInterval: TimeInterval = 10.0
 
 final class AudioEngine {
   static let shared = AudioEngine()
@@ -26,6 +37,19 @@ final class AudioEngine {
   private var tapUUID: NSUUID?
 
   private var callbackCount: UInt64 = 0
+
+  private var tapSource: TapSource = .everythingExceptSelf
+  private var processListListenerBlock: AudioObjectPropertyListenerBlock?
+  private var fineTuneProcessListener: (objectID: AudioObjectID, block: AudioObjectPropertyListenerBlock)?
+  private var workspaceObservers: [NSObjectProtocol] = []
+  private var safetyNetTimer: Timer?
+  private var evaluationWork: DispatchWorkItem?
+  private var fallbackWork: DispatchWorkItem?
+  private var processListAddress = AudioObjectPropertyAddress(
+    mSelector: kAudioHardwarePropertyProcessObjectList,
+    mScope: kAudioObjectPropertyScopeGlobal,
+    mElement: kAudioObjectPropertyElementMain
+  )
 
   private init() {}
 
@@ -77,6 +101,7 @@ final class AudioEngine {
 
     isRunning = true
     installDeviceListListener()
+    startTapSourceMonitor()
     logger.info(
       "Audio engine started. Output=\(outputDeviceID) DSP=\(processingEnabled)"
     )
@@ -85,6 +110,7 @@ final class AudioEngine {
   func stop() {
     guard isRunning else { return }
 
+    stopTapSourceMonitor()
     removeDeviceListListener()
     teardownPipeline()
 
@@ -124,15 +150,71 @@ final class AudioEngine {
     return processObjectID
   }
 
-  private func createTap() -> Bool {
-    guard let processObjID = getCurrentProcessObjectID() else {
-      logger.error("Could not get process object ID for current process")
-      return false
-    }
-
-    let desc = CATapDescription(
-      __stereoGlobalTapButExcludeProcesses: [NSNumber(value: processObjID)]
+  private func processObjectID(forPID pid: pid_t) -> AudioObjectID? {
+    var addr = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
     )
+    var inPID = pid
+    var objectID: AudioObjectID = kAudioObjectUnknown
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    let status = AudioObjectGetPropertyData(
+      AudioObjectID(kAudioObjectSystemObject),
+      &addr,
+      UInt32(MemoryLayout<pid_t>.size),
+      &inPID,
+      &size,
+      &objectID
+    )
+    guard status == noErr, objectID != kAudioObjectUnknown else { return nil }
+    return objectID
+  }
+
+  private func isProcessRunning(_ objectID: AudioObjectID) -> Bool {
+    var addr = AudioObjectPropertyAddress(
+      mSelector: kAudioProcessPropertyIsRunning,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var value: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    let status = AudioObjectGetPropertyData(objectID, &addr, 0, nil, &size, &value)
+    return status == noErr && value != 0
+  }
+
+  private func findFineTuneProcessObject() -> AudioObjectID? {
+    for app in NSRunningApplication.runningApplications(withBundleIdentifier: fineTuneBundleID) {
+      if let objectID = processObjectID(forPID: app.processIdentifier) {
+        return objectID
+      }
+    }
+    return nil
+  }
+
+  private func resolveTapSource() -> TapSource {
+    if let objectID = findFineTuneProcessObject(), isProcessRunning(objectID) {
+      return .fineTune(objectID)
+    }
+    return .everythingExceptSelf
+  }
+
+  private func createTap() -> Bool {
+    let source = resolveTapSource()
+
+    let desc: CATapDescription
+    switch source {
+    case let .fineTune(fineTuneObjectID):
+      desc = CATapDescription(stereoMixdownOfProcesses: [fineTuneObjectID])
+    case .everythingExceptSelf:
+      guard let processObjID = getCurrentProcessObjectID() else {
+        logger.error("Could not get process object ID for current process")
+        return false
+      }
+      desc = CATapDescription(
+        __stereoGlobalTapButExcludeProcesses: [NSNumber(value: processObjID)]
+      )
+    }
     desc.muteBehavior = .muted
     desc.isPrivate = true
     desc.name = "ViPER4Mac Tap"
@@ -146,7 +228,8 @@ final class AudioEngine {
       return false
     }
     tapID = newTapID
-    logger.info("Process tap created: \(tapID) uuid=\(desc.uuid.uuidString)")
+    tapSource = source
+    logger.info("Process tap created: \(tapID) uuid=\(desc.uuid.uuidString) source=\(source)")
     return true
   }
 
@@ -292,6 +375,197 @@ final class AudioEngine {
     destroyIOProc()
     destroyAggregateDevice()
     destroyTap()
+  }
+
+  private func startTapSourceMonitor() {
+    guard processListListenerBlock == nil else { return }
+
+    let listBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+      self?.scheduleTapSourceEvaluation()
+    }
+    let status = AudioObjectAddPropertyListenerBlock(
+      AudioObjectID(kAudioObjectSystemObject),
+      &processListAddress,
+      .main,
+      listBlock
+    )
+    if status == noErr {
+      processListListenerBlock = listBlock
+    } else {
+      logger.error("Failed to install process list listener: \(status)")
+    }
+
+    let center = NSWorkspace.shared.notificationCenter
+    let names = [
+      NSWorkspace.didLaunchApplicationNotification,
+      NSWorkspace.didTerminateApplicationNotification,
+    ]
+    for name in names {
+      let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+        let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+        guard app?.bundleIdentifier == fineTuneBundleID else { return }
+        self?.scheduleTapSourceEvaluation()
+      }
+      workspaceObservers.append(token)
+    }
+
+    let timer = Timer(timeInterval: tapSourceSafetyNetInterval, repeats: true) { [weak self] _ in
+      self?.scheduleTapSourceEvaluation()
+    }
+    timer.tolerance = tapSourceSafetyNetInterval * 0.2
+    RunLoop.main.add(timer, forMode: .common)
+    safetyNetTimer = timer
+
+    scheduleTapSourceEvaluation()
+  }
+
+  private func stopTapSourceMonitor() {
+    if let block = processListListenerBlock {
+      AudioObjectRemovePropertyListenerBlock(
+        AudioObjectID(kAudioObjectSystemObject),
+        &processListAddress,
+        .main,
+        block
+      )
+      processListListenerBlock = nil
+    }
+
+    detachFineTuneProcessListener()
+
+    for token in workspaceObservers {
+      NSWorkspace.shared.notificationCenter.removeObserver(token)
+    }
+    workspaceObservers.removeAll()
+
+    safetyNetTimer?.invalidate()
+    safetyNetTimer = nil
+
+    evaluationWork?.cancel()
+    evaluationWork = nil
+    cancelFallback()
+  }
+
+  private func attachFineTuneProcessListener(to objectID: AudioObjectID) {
+    var addr = AudioObjectPropertyAddress(
+      mSelector: kAudioProcessPropertyIsRunning,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+      self?.scheduleTapSourceEvaluation()
+    }
+    let status = AudioObjectAddPropertyListenerBlock(objectID, &addr, .main, block)
+    if status == noErr {
+      fineTuneProcessListener = (objectID, block)
+    } else {
+      logger.warning("Failed to install FineTune process listener: \(status)")
+    }
+  }
+
+  private func detachFineTuneProcessListener() {
+    guard let listener = fineTuneProcessListener else { return }
+    var addr = AudioObjectPropertyAddress(
+      mSelector: kAudioProcessPropertyIsRunning,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    let status = AudioObjectRemovePropertyListenerBlock(
+      listener.objectID, &addr, .main, listener.block
+    )
+    if status != noErr, status != OSStatus(kAudioHardwareBadObjectError) {
+      logger.warning("Failed to remove FineTune process listener: \(status)")
+    }
+    fineTuneProcessListener = nil
+  }
+
+  private func syncFineTuneProcessListener() {
+    let current = findFineTuneProcessObject()
+    if fineTuneProcessListener?.objectID == current { return }
+    detachFineTuneProcessListener()
+    if let current {
+      attachFineTuneProcessListener(to: current)
+    }
+  }
+
+  private func scheduleTapSourceEvaluation() {
+    evaluationWork?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      self?.evaluateTapSource()
+    }
+    evaluationWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + tapSourceCoalesceDelay, execute: work)
+  }
+
+  private func cancelFallback() {
+    fallbackWork?.cancel()
+    fallbackWork = nil
+  }
+
+  private func evaluateTapSource() {
+    guard isRunning else { return }
+
+    syncFineTuneProcessListener()
+
+    let desired = resolveTapSource()
+    if desired == tapSource {
+      cancelFallback()
+      return
+    }
+
+    if case .fineTune = tapSource, desired == .everythingExceptSelf {
+      guard fallbackWork == nil else { return }
+      let work = DispatchWorkItem { [weak self] in
+        self?.fallbackWork = nil
+        self?.applyResolvedTapSource()
+      }
+      fallbackWork = work
+      DispatchQueue.main.asyncAfter(deadline: .now() + fineTuneFallbackDelay, execute: work)
+      return
+    }
+
+    cancelFallback()
+    applyResolvedTapSource()
+  }
+
+  private func applyResolvedTapSource() {
+    guard isRunning else { return }
+    let desired = resolveTapSource()
+    guard desired != tapSource else { return }
+    logger.info("Tap source changing: \(tapSource) -> \(desired)")
+    rebuildPipeline()
+  }
+
+  private func rebuildPipeline() {
+    teardownPipeline()
+
+    guard createTap() else {
+      logger.error("Failed to create tap while rebuilding pipeline")
+      return
+    }
+
+    guard createAggregateDevice() else {
+      logger.error("Failed to create aggregate device while rebuilding pipeline")
+      destroyTap()
+      return
+    }
+
+    guard createIOProc() else {
+      logger.error("Failed to create IOProc while rebuilding pipeline")
+      destroyAggregateDevice()
+      destroyTap()
+      return
+    }
+
+    let status = AudioDeviceStart(aggregateDeviceID, ioProcID!)
+    if status != noErr {
+      logger.error("Failed to start aggregate device while rebuilding pipeline: \(status)")
+      destroyIOProc()
+      destroyAggregateDevice()
+      destroyTap()
+      return
+    }
+
+    callbackCount = 0
   }
 
   // MARK: - Device Change Handling
