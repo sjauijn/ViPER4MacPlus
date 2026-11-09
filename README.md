@@ -48,14 +48,14 @@ Use one or the other, not both.
 
 ### Pre-built release
 
-Download the latest release from the [Releases page](https://github.com/likelikeslike/ViPER4Mac/releases). Copy the `ViPER4Mac.app` bundle to your Applications folder and launch it.
+Download the latest release from the [Releases page](https://github.com/sjauijn/ViPER4MacPlus/releases). Copy the `ViPER4Mac.app` bundle to your Applications folder and launch it.
 
 ### From source
 
 Xcode with command line tools required.
 
 ```bash
-git clone --recursive https://github.com/likelikeslike/ViPER4Mac.git && cd ViPER4Mac
+git clone --recursive https://github.com/sjauijn/ViPER4MacPlus.git && cd ViPER4MacPlus
 make install
 ```
 
